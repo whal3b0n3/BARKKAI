@@ -1559,6 +1559,170 @@ Function Get-AllEntraServicePrincipals {
     $ServicePrincipalObjects
 }
 
+Function Get-AllEntraServicePrincipalsWithRoles {
+    <#
+    .SYNOPSIS
+        Retrieves all JSON-formatted Entra service principal objects with assigned Entra roles using the MS Graph API
+
+        Author: Andy Robbins (@_wald0)
+        License: GPLv3
+        Required Dependencies: None
+
+    .DESCRIPTION
+        Retrieves all JSON-formatted Entra service principal objects and their assigned Entra ID admin roles using the MS Graph API
+        Each service principal object will include a "roles" array containing all assigned directory roles
+
+    .PARAMETER Token
+        The MS Graph-scoped JWT for the user with read access to Entra service principals and roles
+
+    .PARAMETER ShowProgress
+        Switch to display progress during enumeration
+
+    .PARAMETER IncludeRoles
+        Switch to include Entra role information for each service principal (default: $True)
+
+    .EXAMPLE
+    C:\PS> $ServicePrincipals = Get-AllEntraServicePrincipals -Token $Token -ShowProgress
+
+    Description
+    -----------
+    Uses the JWT in the $Token variable to list all service principals with their assigned Entra roles
+
+    .EXAMPLE
+    C:\PS> $ServicePrincipals = Get-AllEntraServicePrincipals -Token $Token -ShowProgress -IncludeRoles $False
+
+    Description
+    -----------
+    Lists all service principals without fetching role information (faster)
+
+    .LINK
+        https://learn.microsoft.com/en-us/graph/api/serviceprincipal-list?view=graph-rest-1.0&tabs=http
+        https://learn.microsoft.com/en-us/graph/api/serviceprincipal-list-memberof?view=graph-rest-1.0
+    #>
+    [CmdletBinding()] Param (
+        [Parameter(
+            Mandatory = $True,
+            ValueFromPipeline = $True,
+            ValueFromPipelineByPropertyName = $True
+        )]
+        [String]
+        $Token,
+
+        [Parameter(
+            Mandatory = $False
+        )]
+        [Switch]
+        $ShowProgress = $False,
+
+        [Parameter(
+            Mandatory = $False
+        )]
+        [Bool]
+        $IncludeRoles = $True
+    )
+
+    # Get all service principals
+    $URI = "https://graph.microsoft.com/beta/servicePrincipals/?`$count=true"
+    $Results = $null
+    $ServicePrincipalObjects = $null
+
+    If ($ShowProgress) {
+        Write-Progress -Activity "Enumerating Service Principals" -Status "Initial request..."
+    }
+
+    do {
+        $Results = Invoke-RestMethod `
+            -Headers @{
+                Authorization = "Bearer $($Token)"
+                ConsistencyLevel = "eventual"
+            } `
+            -URI $URI `
+            -UseBasicParsing `
+            -Method "GET" `
+            -ContentType "application/json"
+        if ($Results.'@odata.count') {
+            $TotalServicePrincipalCount = $Results.'@odata.count'
+        }
+        if ($Results.value) {
+            $ServicePrincipalObjects += $Results.value
+        } else {
+            $ServicePrincipalObjects += $Results
+        }
+        $uri = $Results.'@odata.nextlink'
+        If ($ShowProgress) {
+            $PercentComplete = ([Int32](($ServicePrincipalObjects.count/$TotalServicePrincipalCount)*100))
+            Write-Progress -Activity "Enumerating Service Principals" -Status "$($PercentComplete)% complete [$($ServicePrincipalObjects.count) of $($TotalServicePrincipalCount)]" -PercentComplete $PercentComplete
+        }
+    } until (!($uri))
+
+    # If IncludeRoles is enabled, fetch Entra role information for each service principal
+    If ($IncludeRoles) {
+        If ($ShowProgress) {
+            Write-Progress -Activity "Enumerating Service Principals" -Status "Fetching Entra role information..." -Id 1
+        }
+
+        $SpCount = $ServicePrincipalObjects.Count
+        $CurrentSpCount = 0
+
+        foreach ($ServicePrincipal in $ServicePrincipalObjects) {
+            $CurrentSpCount++
+
+            If ($ShowProgress) {
+                $PercentComplete = ([Int32](($CurrentSpCount/$SpCount)*100))
+                Write-Progress -Activity "Enumerating Service Principals" `
+                    -Status "Fetching roles: $($ServicePrincipal.displayName) [$($CurrentSpCount) of $($SpCount)]" `
+                    -PercentComplete $PercentComplete `
+                    -Id 1
+            }
+
+            # Get memberOf for this service principal
+            $MemberOfURI = "https://graph.microsoft.com/v1.0/servicePrincipals/$($ServicePrincipal.appId)/memberOf"
+            $MemberOfResults = $null
+            $EntraRoles = @()
+
+            do {
+                try {
+                    $MemberOfResponse = Invoke-RestMethod `
+                        -Headers @{
+                            Authorization = "Bearer $($Token)"
+                            ConsistencyLevel = "eventual"
+                        } `
+                        -URI $MemberOfURI `
+                        -UseBasicParsing `
+                        -Method "GET" `
+                        -ContentType "application/json" `
+                        -ErrorAction Stop
+
+                    # Filter for directoryRole objects only
+                    if ($MemberOfResponse.value) {
+                        $DirectoryRoles = $MemberOfResponse.value #| Where-Object { $_.'@odata.type' -eq '#microsoft.graph.directoryRole' }
+                        $EntraRoles += $DirectoryRoles
+                    } elseif ($MemberOfResponse -is [object]) {
+                    #} elseif ($MemberOfResponse -is [object] -and $MemberOfResponse.'@odata.type' -eq '#microsoft.graph.directoryRole') {
+                        $EntraRoles += $MemberOfResponse
+                    }
+
+                    $MemberOfURI = $MemberOfResponse.'@odata.nextlink'
+                }
+                catch {
+                    Write-Warning "Failed to get roles for service principal $($ServicePrincipal.displayName): $_"
+                    $MemberOfURI = $null
+                }
+            } until (!($MemberOfURI))
+
+            # Add roles information to the service principal object
+            $ServicePrincipal | Add-Member -NotePropertyName "roles" -NotePropertyValue $EntraRoles -Force
+            $ServicePrincipal | Add-Member -NotePropertyName "roleCount" -NotePropertyValue $EntraRoles.Count -Force
+        }
+
+        If ($ShowProgress) {
+            Write-Progress -Activity "Enumerating Service Principals" -Completed -Id 1
+        }
+    }
+
+    $ServicePrincipalObjects
+}
+
 Function Get-EntraServicePrincipal {
     <#
     .SYNOPSIS
